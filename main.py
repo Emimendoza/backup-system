@@ -7,8 +7,11 @@ import argparse
 import base64
 import sqlite3
 import fcntl
+from abc import ABC, abstractmethod
+
 import tqdm
 import multiprocessing
+import lzma
 from sys import exit
 from typing import AnyStr, List
 from dataclasses import dataclass
@@ -16,6 +19,7 @@ from dataclasses import dataclass
 # CRYPTOGRAPHY
 
 from cryptography.hazmat.primitives.ciphers.algorithms import AES256
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers import Cipher
 from cryptography.hazmat.primitives.ciphers.modes import CBC
 
@@ -43,9 +47,12 @@ folder BOOLEAN,
 deleted BOOLEAN,
 deleted_at INTEGER,
 uploaded_at INTEGER,
-iv BLOB, sha512 BLOB,
+iv BLOB, 
+sha512 BLOB,
 size INTEGER,
-permissions INTEGER)
+permissions INTEGER,
+compression TEXT,
+compressed_size INTEGER)
 '''
 CREATE_VARS_TABLE: str = '''
 CREATE TABLE IF NOT EXISTS VARS (
@@ -66,12 +73,30 @@ SELECT * FROM FILES WHERE local_path like ? || '_%'
 '''
 
 
+# Helper Functions
 def bytes_to_human(size: int) -> AnyStr:
 	for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
 		if size < 1024:
 			return f'{size:.2f} {unit}'
 		size /= 1024
 	return f'{size:.2f} PB'
+
+
+def sha512_str(s: AnyStr) -> bytes:
+	digest = hashes.Hash(hashes.SHA512())
+	digest.update(s.encode('utf-8'))
+	return digest.finalize()
+
+
+def sha512_file(file: AnyStr) -> bytes:
+	digest = hashes.Hash(hashes.SHA512())
+	with open(file, 'rb') as f:
+		while True:
+			chunk = f.read(1024)
+			if not chunk:
+				break
+			digest.update(chunk)
+	return digest.finalize()
 
 
 def epoch_to_datetime(epoch: int) -> AnyStr:
@@ -94,6 +119,8 @@ class FILE:
 	sha512: bytes
 	size: int
 	permissions: int
+	compression: AnyStr
+	compressed_size: int
 
 	def str(self):
 		return f'[{'DIR' if self.folder else 'FIL'}] {self.local_path} | {bytes_to_human(self.size)}'
@@ -108,14 +135,70 @@ class FILE:
 			                                                                             f'HASH: {self.iv}\n'
 
 
+# Compressors
+class Compressor(ABC):
+	@abstractmethod
+	def __init__(self, decompress: bool):
+		pass
+
+	@abstractmethod
+	def compress(self, data: bytes) -> bytes:
+		pass
+
+	@abstractmethod
+	def decompress(self, data: bytes) -> bytes:
+		pass
+
+	@abstractmethod
+	def finalize(self) -> bytes:
+		pass
+
+
+class CompressorNone(Compressor):
+	def __init__(self, decompress: bool):
+		pass
+
+	def compress(self, data: bytes) -> bytes:
+		return data
+
+	def decompress(self, data: bytes) -> bytes:
+		return data
+
+	def finalize(self) -> bytes:
+		return b''
+
+
+class XZCompressor(Compressor):
+	_decompress: bool
+
+	def __init__(self, decompress: bool):
+		self._decompress = decompress
+		self.ctx = lzma.LZMADecompressor() if decompress else lzma.LZMACompressor()
+
+	def compress(self, data: bytes) -> bytes:
+		return self.ctx.compress(data)
+
+	def decompress(self, data: bytes) -> bytes:
+		return self.ctx.decompress(data)
+
+	def finalize(self) -> bytes:
+		if self._decompress:
+			return b''
+		return self.ctx.flush()
+
+
+NAME_TO_COMPRESSOR = {
+	'none': CompressorNone,
+	'xz': XZCompressor
+}
+
 # ARGUMENT PARSING
 ADDITIONAL_INFO_LINE = '''
 Additional Notes: 
 - Each file is individually encrypted with AES256 
 - The iv of each file is stored in the metadata database 
 - The database is also encrypted but the iv is placed in a separate file and in plane text 
-- The options `-e` and `-d` are for manual file encryption and decryption and the IV is NOT stored in the db. 
-- if <iv> is -1, a random iv will be generated and printed to stdout, this is REQUIRED to decrypt the file. 
+- The options `-e` and `-d` are for manual file encryption and decryption and the IV-Len is NOT stored in the db. 
 - The following special paths can be used: 
 	\\BASE_PATH: The base path of the backup system (default: ~/.backup_system/) 
 	\\KEY_PATH: The path to the symmetric key (default: ~/.backup_system/aes256_key.priv) 
@@ -127,6 +210,8 @@ Additional Notes:
 - By default, files that have been modified will have the string '.modified<TIMESTAMP>' appended to  
   the old filename in the db and will have the old version deleted after 1 week. 
 - Passing 'none' to --ssh will result in no remote storage being used.
+- IV-Len is the IV followed by the size of the file in bytes. (16 bytes IV + 8 bytes big endian size)
+- The `-c` option takes one of the following: none, xz
 Author: Emilio Mendoza Reyes 
 '''
 
@@ -137,13 +222,14 @@ parser = argparse.ArgumentParser(prog='backup-system',
 parser.add_argument('-g', '--generate-key', action='store_true', help='Generate a new symmetric key')
 parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
 parser.add_argument('-t', '--threads', type=int, help='Number of threads to use', default=multiprocessing.cpu_count())
+parser.add_argument('-c', '--compress', type=str, help='Compress files before encrypting', default='none')
 parser.add_argument('--base-path', type=str, help='Base path for the db and mount dir.', default=DEF_BASE_PATH)
 parser.add_argument('--delete-timer-secs', type=int, help='Delete timer in seconds', default=DEF_DELETE_TIMER_SECS)
 parser.add_argument('-e', '--encrypt', type=str, nargs=2,
                     metavar=('<in-path>', '<out-path>'),
                     help='Encrypt file.')
 parser.add_argument('-d', '--decrypt', type=str, nargs=3,
-                    metavar=('<in-path>', '<out-path>', '<iv>'),
+                    metavar=('<in-path>', '<out-path>', '<IV-Len>'),
                     help='Decrypt file.')
 parser.add_argument('-b', '--backup', action='store_true',
                     help='Backup system to remote storage, implies -p')
@@ -170,6 +256,7 @@ SERVER: AnyStr | None = None
 SQLITE_CONNECTION: sqlite3.Connection | None = None
 DELETE_TIMER_SECS: int | None = None
 THREADS: int | None = None
+COMPRESSION_STR: AnyStr | None = None
 
 vprint: callable = lambda *a, **k: None
 mutex = multiprocessing.Lock()
@@ -191,40 +278,53 @@ def get_flock():
 		exit('Another instance is already running. Exiting...')
 
 
-def encrypt_file(file: FILE, iv: bytes, key: bytes) -> None:
+def encrypt_file(file: FILE, iv: bytes, key: bytes) -> int:
 	cipher = Cipher(AES256(key), CBC(iv))
+	compressor = NAME_TO_COMPRESSOR[file.compression](False)
 	encryptor = cipher.encryptor()
+	encrypted = 0
 	with open(file.local_path, 'rb') as f, open(file.remote_path, 'wb') as o:
 		# Read file in chunks
 		while True:
 			chunk = f.read(1024)
 			if not chunk:
 				break
-			if len(chunk) % 16 != 0:
-				chunk += os.urandom(16 - len(chunk) % 16)
+			chunk = compressor.compress(chunk)
+			encrypted += len(chunk)
 			o.write(encryptor.update(chunk))
+		# Finalize compression
+		chunk = compressor.finalize()
+		encrypted += len(chunk)
+		# Pad file to 16 bytes
+		if encrypted % 16 != 0:
+			pad = os.urandom(16 - (encrypted % 16))
+			chunk += pad
+		o.write(encryptor.update(chunk))
 		# Finalize encryption
 		o.write(encryptor.finalize())
+		return encrypted
 
 
 def decrypt_file(file: FILE, iv: bytes, key: bytes) -> None:
 	cipher = Cipher(AES256(key), CBC(iv))
+	decompressor = NAME_TO_COMPRESSOR[file.compression](True)
 	decryptor = cipher.decryptor()
-	written = 0
-	with open(file.remote_path, 'rb') as f, open(file.local_path, 'wb+') as o:
+	decrypted = 0
+	with open(file.remote_path, 'rb') as f, open(file.local_path, 'wb') as o:
 		# Read file in chunks
 		while True:
 			chunk = f.read(1024)
 			if not chunk:
 				break
-
-			written += o.write(decryptor.update(chunk))
-		written += o.write(decryptor.finalize())
-		if written > file.size:
-			vprint(f'Removing Padding for {file.local_path}')
-			o.truncate(file.size)
-		if written < file.size:
-			wprint(f'File {file.local_path} is smaller than expected. Expected: {file.size}, Actual: {written}')
+			chunk = decryptor.update(chunk)[:(file.compressed_size - decrypted)]
+			decrypted += len(chunk)
+			o.write(decompressor.decompress(chunk))
+		# Finalize decompression
+		chunk = decryptor.finalize()[:(file.compressed_size - decrypted)]
+		if chunk:
+			o.write(decompressor.decompress(chunk))
+			o.write(decompressor.finalize())
+		vprint(f'Decrypted {file.remote_path} to {file.local_path}')
 
 
 def generate_key():
@@ -281,12 +381,10 @@ def get_key() -> bytes:
 def encrypt_file_op(info: List[AnyStr]):
 	key = get_key()
 	iv = os.urandom(16)
-	f = FILE(get_real_path(info[0]), get_real_path(info[1]), False, False, 0, 0, iv, b'', 0, 0)
-	f.size = os.path.getsize(f.local_path)
-	iv_and_size = iv + f.size.to_bytes(8, 'big')
-	print(f'Generated IV: {base64.b64encode(iv_and_size).decode("utf-8")}\nYou need this to decrypt the file.')
-
-	encrypt_file(f, iv, key)
+	f = FILE(get_real_path(info[0]), get_real_path(info[1]), False, False, 0, 0, iv, b'', 0, 0, COMPRESSION_STR, 0)
+	f.compressed_size = encrypt_file(f, iv, key)
+	iv_and_size = iv + f.compressed_size.to_bytes(8, 'big')
+	print(f'Generated IV-Len: {base64.b64encode(iv_and_size).decode("utf-8")}\nYou need this to decrypt the file.')
 	print(f'Encrypted {info[0]} as {info[1]}')
 
 
@@ -295,7 +393,7 @@ def decrypt_file_op(info: List[AnyStr]):
 	iv_and_size = base64.b64decode(info[2])
 	iv = iv_and_size[:16]
 	size = int.from_bytes(iv_and_size[-8:], 'big')
-	f = FILE(get_real_path(info[1]), get_real_path(info[0]), False, False, 0, 0, iv, b'', size, 0)
+	f = FILE(get_real_path(info[1]), get_real_path(info[0]), False, False, 0, 0, iv, b'', 0, 0, COMPRESSION_STR, size)
 	decrypt_file(f, iv, key)
 	print(f'Decrypted {info[0]} from {info[1]}')
 
@@ -453,11 +551,14 @@ def parse_paths():
 	global PATHS_TO_BACKUP, PATHS_TO_EXCLUDE
 	# Named Paths
 	global BASE_PATH, KEY_PATH, MOUNT_PATH, METADATA_PATH, METADATA_IV_PATH, SQLITE_CONNECTION, \
-		DELETE_TIMER_SECS, SERVER, THREADS
+		DELETE_TIMER_SECS, SERVER, THREADS, COMPRESSION_STR
 
 	DELETE_TIMER_SECS = args.delete_timer_secs
 	SERVER = args.ssh
 	THREADS = args.threads
+	COMPRESSION_STR = args.compress
+	if COMPRESSION_STR not in NAME_TO_COMPRESSOR:
+		exit('Invalid compression type')
 
 	# Expand paths
 	BASE_PATH = args.base_path
