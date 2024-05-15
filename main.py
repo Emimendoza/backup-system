@@ -103,8 +103,9 @@ def epoch_to_datetime(epoch: int) -> AnyStr:
 	return datetime.datetime.fromtimestamp(epoch).strftime('%Y-%m-%d_%H:%M:%S')
 
 
+# get hex string from bytes
 def hash_to_str(h: bytes) -> AnyStr:
-	return base64.b64encode(h).decode('utf-8')
+	return ''.join(f'{b:02x}' for b in h)
 
 
 @dataclass
@@ -309,6 +310,7 @@ def decrypt_file(file: FILE, iv: bytes, key: bytes) -> None:
 	cipher = Cipher(AES256(key), CBC(iv))
 	decompressor = NAME_TO_COMPRESSOR[file.compression](True)
 	decryptor = cipher.decryptor()
+	digest = hashes.Hash(hashes.SHA512())
 	decrypted = 0
 	with open(file.remote_path, 'rb') as f, open(file.local_path, 'wb') as o:
 		# Read file in chunks
@@ -318,13 +320,22 @@ def decrypt_file(file: FILE, iv: bytes, key: bytes) -> None:
 				break
 			chunk = decryptor.update(chunk)[:(file.compressed_size - decrypted)]
 			decrypted += len(chunk)
-			o.write(decompressor.decompress(chunk))
+			chunk = decompressor.decompress(chunk)
+			digest.update(chunk)
+			o.write(chunk)
 		# Finalize decompression
 		chunk = decryptor.finalize()[:(file.compressed_size - decrypted)]
 		if chunk:
-			o.write(decompressor.decompress(chunk))
-			o.write(decompressor.finalize())
-		vprint(f'Decrypted {file.remote_path} to {file.local_path}')
+			chunk = decompressor.decompress(chunk)
+			digest.update(chunk)
+			o.write(chunk)
+			chunk = decompressor.finalize()
+			digest.update(chunk)
+			o.write(chunk)
+		f_hash = digest.finalize()
+		if file.sha512 != b'' and file.sha512 != f_hash:
+			wprint(f'Hash mismatch for {file.local_path}, Might be corrupted')
+		vprint(f'Decrypted {file.remote_path} to {file.local_path}\n\tHash: {hash_to_str(f_hash)}')
 
 
 def generate_key():
