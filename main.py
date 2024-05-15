@@ -139,9 +139,9 @@ parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output
 parser.add_argument('-t', '--threads', type=int, help='Number of threads to use', default=multiprocessing.cpu_count())
 parser.add_argument('--base-path', type=str, help='Base path for the db and mount dir.', default=DEF_BASE_PATH)
 parser.add_argument('--delete-timer-secs', type=int, help='Delete timer in seconds', default=DEF_DELETE_TIMER_SECS)
-parser.add_argument('-e', '--encrypt', type=str, nargs=3,
-                    metavar=('<in-path>', '<out-path>', '<iv>'),
-                    help='Encrypt file. Set <iv> -1 to make random iv.')
+parser.add_argument('-e', '--encrypt', type=str, nargs=2,
+                    metavar=('<in-path>', '<out-path>'),
+                    help='Encrypt file.')
 parser.add_argument('-d', '--decrypt', type=str, nargs=3,
                     metavar=('<in-path>', '<out-path>', '<iv>'),
                     help='Decrypt file.')
@@ -194,12 +194,15 @@ def get_flock():
 def encrypt_file(file: FILE, iv: bytes, key: bytes) -> None:
 	cipher = Cipher(AES256(key), CBC(iv))
 	encryptor = cipher.encryptor()
-	with open(file.local_path, 'rb'), open(file.remote_path, 'wb') as (f, o):
+	with open(file.local_path, 'rb') as f, open(file.remote_path, 'wb') as o:
 		# Read file in chunks
 		while True:
 			chunk = f.read(1024)
 			if not chunk:
 				break
+			if len(chunk) % 16 != 0:
+				# Pad to 16 bytes
+				chunk += b' ' * (16 - len(chunk) % 16)
 			o.write(encryptor.update(chunk))
 		# Finalize encryption
 		o.write(encryptor.finalize())
@@ -208,15 +211,18 @@ def encrypt_file(file: FILE, iv: bytes, key: bytes) -> None:
 def decrypt_file(file: FILE, iv: bytes, key: bytes) -> None:
 	cipher = Cipher(AES256(key), CBC(iv))
 	decryptor = cipher.decryptor()
-	with open(file.remote_path, 'rb'), open(file.local_path, 'wb') as (f, o):
+	written = 0
+	with open(file.remote_path, 'rb') as f, open(file.local_path, 'wb') as o:
 		# Read file in chunks
 		while True:
 			chunk = f.read(1024)
 			if not chunk:
 				break
-			o.write(decryptor.update(chunk))
-		# Finalize decryption
-		o.write(decryptor.finalize())
+			to_write = decryptor.update(chunk)[:file.size - written]
+			o.write(to_write)
+			written += len(to_write)
+		to_write = decryptor.finalize()[:file.size - written]
+		o.write(to_write)
 
 
 def generate_key():
@@ -272,19 +278,22 @@ def get_key() -> bytes:
 
 def encrypt_file_op(info: List[AnyStr]):
 	key = get_key()
-	iv = base64.b64decode(info[2])
-	if info[2] == '-1':
-		iv = os.urandom(32)
-		print(f'Generated IV: {base64.b64encode(iv).decode("utf-8")}')
-	f = FILE(info[0], info[1], False, False, 0, 0, iv, b'', 0, 0)
+	iv = os.urandom(16)
+	f = FILE(get_real_path(info[0]), get_real_path(info[1]), False, False, 0, 0, iv, b'', 0, 0)
+	f.size = os.path.getsize(f.local_path)
+	iv_and_size = iv + f.size.to_bytes(8, 'big')
+	print(f'Generated IV: {base64.b64encode(iv_and_size).decode("utf-8")}\n You need this to decrypt the file.')
+
 	encrypt_file(f, iv, key)
 	print(f'Encrypted {info[0]} as {info[1]}')
 
 
 def decrypt_file_op(info: List[AnyStr]):
 	key = get_key()
-	iv = base64.b64decode(info[2])
-	f = FILE(info[0], info[1], False, False, 0, 0, iv, b'', 0, 0)
+	iv_and_size = base64.b64decode(info[2])
+	iv = iv_and_size[:16]
+	size = int.from_bytes(iv[-8:], 'big')
+	f = FILE(get_real_path(info[0]), get_real_path(info[1]), False, False, 0, 0, iv, b'', size, 0)
 	decrypt_file(f, iv, key)
 	print(f'Decrypted {info[0]} from {info[1]}')
 
@@ -426,7 +435,7 @@ def restore_system(paths: List[AnyStr]):
 			files_to_restore[file.local_path] = file
 	mount_remote_storage()
 	total = len(files_to_restore.values())
-	with multiprocessing.Pool(THREADS), tqdm.tqdm(total=total, unit='files') as (pool, bar):
+	with multiprocessing.Pool(THREADS) as pool, tqdm.tqdm(total=total, unit='files') as bar:
 		mp_args = [(file, key) for file in files_to_restore.values()]
 		pool.starmap_async(restore_file, args, callback=done_callback)
 		counter = 0
