@@ -201,8 +201,7 @@ def encrypt_file(file: FILE, iv: bytes, key: bytes) -> None:
 			if not chunk:
 				break
 			if len(chunk) % 16 != 0:
-				# Pad to 16 bytes
-				chunk += b' ' * (16 - len(chunk) % 16)
+				chunk += os.urandom(16 - len(chunk) % 16)
 			o.write(encryptor.update(chunk))
 		# Finalize encryption
 		o.write(encryptor.finalize())
@@ -212,24 +211,27 @@ def decrypt_file(file: FILE, iv: bytes, key: bytes) -> None:
 	cipher = Cipher(AES256(key), CBC(iv))
 	decryptor = cipher.decryptor()
 	written = 0
-	with open(file.remote_path, 'rb') as f, open(file.local_path, 'wb') as o:
+	with open(file.remote_path, 'rb') as f, open(file.local_path, 'wb+') as o:
 		# Read file in chunks
 		while True:
 			chunk = f.read(1024)
 			if not chunk:
 				break
-			to_write = decryptor.update(chunk)[:file.size - written]
-			o.write(to_write)
-			written += len(to_write)
-		to_write = decryptor.finalize()[:file.size - written]
-		o.write(to_write)
+
+			written += o.write(decryptor.update(chunk))
+		written += o.write(decryptor.finalize())
+		if written > file.size:
+			vprint(f'Removing Padding for {file.local_path}')
+			o.truncate(file.size)
+		if written < file.size:
+			wprint(f'File {file.local_path} is smaller than expected. Expected: {file.size}, Actual: {written}')
 
 
 def generate_key():
 	print('Generating a new AES256 symmetric key...')
 	key = os.urandom(32)
 	key_b64 = base64.b64encode(key).decode('utf-8')
-	print(f'Key:{key_b64}\n WRITE THIS DOWN!')
+	print(f'Key: {key_b64}\nWRITE THIS DOWN!')
 	if not os.path.exists(KEY_PATH):
 		with open(KEY_PATH, 'w', encoding='utf-8') as f:
 			f.write(key_b64)
@@ -282,7 +284,7 @@ def encrypt_file_op(info: List[AnyStr]):
 	f = FILE(get_real_path(info[0]), get_real_path(info[1]), False, False, 0, 0, iv, b'', 0, 0)
 	f.size = os.path.getsize(f.local_path)
 	iv_and_size = iv + f.size.to_bytes(8, 'big')
-	print(f'Generated IV: {base64.b64encode(iv_and_size).decode("utf-8")}\n You need this to decrypt the file.')
+	print(f'Generated IV: {base64.b64encode(iv_and_size).decode("utf-8")}\nYou need this to decrypt the file.')
 
 	encrypt_file(f, iv, key)
 	print(f'Encrypted {info[0]} as {info[1]}')
@@ -292,8 +294,8 @@ def decrypt_file_op(info: List[AnyStr]):
 	key = get_key()
 	iv_and_size = base64.b64decode(info[2])
 	iv = iv_and_size[:16]
-	size = int.from_bytes(iv[-8:], 'big')
-	f = FILE(get_real_path(info[0]), get_real_path(info[1]), False, False, 0, 0, iv, b'', size, 0)
+	size = int.from_bytes(iv_and_size[-8:], 'big')
+	f = FILE(get_real_path(info[1]), get_real_path(info[0]), False, False, 0, 0, iv, b'', size, 0)
 	decrypt_file(f, iv, key)
 	print(f'Decrypted {info[0]} from {info[1]}')
 
