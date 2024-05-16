@@ -26,6 +26,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher
 from cryptography.hazmat.primitives.ciphers.modes import CBC
 
 # DEFAULTS/CONSTS
+MAX_RETRIES = 10
 DEF_DELETE_TIMER_SECS: int \
 	= 60 * 60 * 24 * 7  # 1 week
 DEF_BASE_PATH: AnyStr \
@@ -420,7 +421,14 @@ def unmount_remote_storage():
 	if SERVER == 'none':
 		return
 	print('Unmounting remote storage...')
-	ret = os.system(f'{UMOUNT_CMD} {MOUNT_PATH}')
+	counter = 0
+	ret = 1
+	while counter < MAX_RETRIES:
+		ret = os.system(f'{UMOUNT_CMD} {MOUNT_PATH}')
+		if ret != 0:
+			counter += 1
+			time.sleep(5)
+			continue
 	if ret != 0:
 		exit('Failed to unmount remote storage')
 	print('Unmounted.')
