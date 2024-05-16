@@ -634,6 +634,8 @@ def backup_system():
 					traverse_dir(os.path.join(p, item))
 		except PermissionError as e:
 			wprint(f'Permission denied for {p}. {e}')
+		except Exception as e:
+			wprint(f'Error traversing {p}. {e}')
 
 	print('Backing up system...')
 	files_to_backup = {}
