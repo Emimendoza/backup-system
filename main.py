@@ -545,13 +545,18 @@ def bar_thread(t):
 
 
 def backup_if_sha512(file: FILE, sha: bytes, key) -> None:
-	h = sha512_file(file.local_path)
-	if h != sha:
-		unconditional_backup(file, key)
-		return
-	vprint(f'File {file.local_path} the same as the last backup')
-	queue.put(1)
-	result_queue.put(None)
+	try:
+		h = sha512_file(file.local_path)
+		if h != sha:
+			unconditional_backup(file, key)
+			return
+		vprint(f'File {file.local_path} the same as the last backup')
+		queue.put(1)
+		result_queue.put(None)
+	except Exception as e:
+		wprint(f'Error hashing {file.local_path}. {e}')
+		queue.put(1)
+		result_queue.put(None)
 
 
 def get_tempfile_name():
@@ -594,10 +599,15 @@ def unconditional_backup(file: FILE, key) -> None:
 
 
 def backup_dir(file: FILE) -> None:
-	file.permissions = os.stat(file.local_path).st_mode
-	file.uploaded_at = int(datetime.datetime.now().timestamp())
-	queue.put(1)
-	result_queue.put(file)
+	try:
+		file.permissions = os.stat(file.local_path).st_mode
+		file.uploaded_at = int(datetime.datetime.now().timestamp())
+		queue.put(1)
+		result_queue.put(file)
+	except Exception as e:
+		wprint(f'Error backing up {file.local_path}. {e}')
+		queue.put(1)
+		result_queue.put(None)
 
 
 def handle_old(f: FILE) -> None:
@@ -609,13 +619,23 @@ def handle_old(f: FILE) -> None:
 
 
 def handle_new(f: FILE) -> None:
-	new_path = os.path.join(MOUNT_PATH, get_unique_name(f.local_path))
-	new_path = os.path.abspath(new_path)
-	os.rename(f.remote_path, new_path)
-	f.remote_path = new_path
-	f.uploaded_at = int(datetime.datetime.now().timestamp())
-	SQLITE_CONNECTION.execute(INSERT, f.to_sql())
-	vprint(f'Uploaded {f.local_path} to {f.remote_path}')
+	while True:
+		try:
+			new_path = os.path.join(MOUNT_PATH, get_unique_name(f.local_path))
+			new_path = os.path.abspath(new_path)
+			os.rename(f.remote_path, new_path)
+			f.remote_path = new_path
+			f.uploaded_at = int(datetime.datetime.now().timestamp())
+			SQLITE_CONNECTION.execute(INSERT, f.to_sql())
+			vprint(f'Uploaded {f.local_path} to {f.remote_path}')
+			return None
+		except OSError as e:
+			if e.errno == 107:
+				vprint(f'Remote has disconnected. Retrying...')
+		except Exception as e:
+			wprint(f'Error uploading {f.local_path}. {e}')
+			return None
+		time.sleep(5)
 
 
 def get_unique_name(path: AnyStr) -> AnyStr:
