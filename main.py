@@ -868,8 +868,8 @@ def parse_paths():
 		PATHS_TO_BACKUP[i] = get_real_path(path)
 
 	# Expand paths
-	for i, path in enumerate(PATHS_TO_BACKUP):
-		PATHS_TO_BACKUP[i] = get_real_path(path)
+	for i, path in enumerate(PATHS_TO_EXCLUDE):
+		PATHS_TO_EXCLUDE[i] = get_real_path(path)
 
 
 def vprint_func(*nargs, **kwargs):
