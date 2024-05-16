@@ -159,9 +159,9 @@ class FILE:
 		verbose_name = f'[{'DIR' if self.folder else 'FIL'}]: {self.local_path} \n'
 		verbose_name += f'SIZE: {bytes_to_human(self.size)}\n'
 		verbose_name += f'PERMISSIONS: {self.permissions}\n'
-		verbose_name += f'DATE UPLOADED: {epoch_to_datetime(self.uploaded_at)}\n'
-		verbose_name += f'DATE DELETED: {epoch_to_datetime(self.deleted_at)}\n' if self.deleted else ''
-		verbose_name += f'HASH: {self.sha512.hex()}' if self.sha512 != b'' else ''
+		verbose_name += f'DATE UPLOADED: {epoch_to_datetime(self.uploaded_at)}'
+		verbose_name += f'\nDATE DELETED: {epoch_to_datetime(self.deleted_at)}' if self.deleted else ''
+		verbose_name += f'\nHASH: {self.sha512.hex()}' if self.sha512 != b'' else ''
 
 		return verbose_name
 
