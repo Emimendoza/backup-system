@@ -7,6 +7,7 @@ import argparse
 import base64
 import sqlite3
 import fcntl
+import time
 from abc import ABC, abstractmethod
 from io import TextIOWrapper
 
@@ -36,7 +37,9 @@ DEF_PATHS_TO_BACKUP: List[AnyStr] = [
 DEF_PATHS_TO_EXCLUDE: List[AnyStr] = [
 	'\\BACKUP_SYSTEM_MOUNT'
 ]
-MOUNT_CMD: str = 'sshfs -o sshfs_sync' if os.system('command -v sshfs > /dev/null') == 0 else exit('sshfs not found')
+SSHFS_OPTIONS: str = ('-o sshfs_sync -o max_conns=10 -o reconnect -o ServerAliveInterval=15 -o ServerAliveCountMax=3 '
+                      '-o allow_other -o follow_symlinks')
+MOUNT_CMD: str = f'sshfs {SSHFS_OPTIONS}' if os.system('command -v sshfs > /dev/null') == 0 else exit('sshfs not found')
 UMOUNT_CMD: str = 'fusermount3 -u' if os.system('command -v fusermount3 > /dev/null') == 0 else 'fusermount -u'
 
 # SQL ENTRIES
@@ -121,7 +124,7 @@ def sha512_file(file: AnyStr) -> bytes:
 	digest = hashes.Hash(hashes.SHA512())
 	with open(file, 'rb') as f:
 		while True:
-			chunk = f.read(1024)
+			chunk = f.read(4096)
 			if not chunk:
 				break
 			digest.update(chunk)
@@ -158,7 +161,7 @@ class FILE:
 	def str_v(self):
 		verbose_name = f'[{'DIR' if self.folder else 'FIL'}]: {self.local_path} \n'
 		verbose_name += f'SIZE: {bytes_to_human(self.size)}\n'
-		verbose_name += f'PERMISSIONS: {self.permissions}\n'
+		verbose_name += f'PERMISSIONS: {oct(self.permissions)}\n'
 		verbose_name += f'DATE UPLOADED: {epoch_to_datetime(self.uploaded_at)}'
 		verbose_name += f'\nDATE DELETED: {epoch_to_datetime(self.deleted_at)}' if self.deleted else ''
 		verbose_name += f'\nHASH: {self.sha512.hex()}' if self.sha512 != b'' else ''
@@ -329,9 +332,10 @@ def encrypt_file(file: FILE, iv: bytes, key: bytes) -> (int, bytes):
 	encryptor = cipher.encryptor()
 	encrypted = 0
 	with open(file.local_path, 'rb') as f, open(file.remote_path, 'wb') as o:
+		os.chmod(file.remote_path, 0o600)
 		# Read file in chunks
 		while True:
-			chunk = f.read(1024)
+			chunk = f.read(4096)
 			if not chunk:
 				break
 			digest.update(chunk)
@@ -361,7 +365,7 @@ def decrypt_file(file: FILE, iv: bytes, key: bytes) -> None:
 	with open(file.remote_path, 'rb') as f, open(file.local_path, 'wb') as o:
 		# Read file in chunks
 		while True:
-			chunk = f.read(1024)
+			chunk = f.read(4096)
 			if not chunk:
 				break
 			chunk = decryptor.update(chunk)[:(file.compressed_size - decrypted)]
@@ -565,7 +569,23 @@ def get_tempfile_name():
 def unconditional_backup(file: FILE, key) -> None:
 	file.iv = os.urandom(16)
 	file.remote_path = get_tempfile_name()
-	compressed_size, sha = encrypt_file(file, file.iv, key)
+	compressed_size, sha = (0, b'')
+	while True:
+		try:
+			if not os.path.exists(file.local_path):
+				wprint(f'File {file.local_path} does not exist')
+				queue.put(1)
+				result_queue.put(None)
+				return
+			compressed_size, sha = encrypt_file(file, file.iv, key)
+			break
+		except OSError as e:
+			if e.errno == 107:
+				vprint(f'Remote has disconnected. Retrying...')
+		except Exception as e:
+			wprint(f'Error encrypting {file.local_path}. {e}')
+		time.sleep(5)
+
 	file.compressed_size = compressed_size
 	file.sha512 = sha
 	file.uploaded_at = int(datetime.datetime.now().timestamp())
