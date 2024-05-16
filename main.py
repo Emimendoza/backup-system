@@ -39,7 +39,7 @@ DEF_PATHS_TO_EXCLUDE: List[AnyStr] = [
 	'\\BACKUP_SYSTEM_MOUNT'
 ]
 SSHFS_OPTIONS: str = ('-o sshfs_sync -o max_conns=10 -o reconnect -o ServerAliveInterval=15 -o ServerAliveCountMax=3 '
-                      '-o allow_other -o follow_symlinks')
+                      '-o follow_symlinks')
 MOUNT_CMD: str = f'sshfs {SSHFS_OPTIONS}' if os.system('command -v sshfs > /dev/null') == 0 else exit('sshfs not found')
 UMOUNT_CMD: str = 'fusermount3 -u' if os.system('command -v fusermount3 > /dev/null') == 0 else 'fusermount -u'
 
