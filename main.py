@@ -620,17 +620,20 @@ def backup_system():
 		if not os.path.exists(p):
 			wprint(f'Path {p} does not exist')
 			return
-		permissions = os.stat(p).st_mode
-		if os.path.isfile(p):
-			# Get file info
-			size = os.path.getsize(p)
-			files_to_backup[p] = FILE(p, '', False, False, 0, 0, b'', b'', size, permissions, COMPRESSION_STR, 0)
-			return
-		if os.path.isdir(p):
-			items_in_dir = os.listdir(p)
-			files_to_backup[p] = FILE(p, '', True, False, 0, 0, b'', b'', 0, permissions, COMPRESSION_STR, 0)
-			for item in items_in_dir:
-				traverse_dir(os.path.join(p, item))
+		try:
+			permissions = os.stat(p).st_mode
+			if os.path.isfile(p):
+				# Get file info
+				size = os.path.getsize(p)
+				files_to_backup[p] = FILE(p, '', False, False, 0, 0, b'', b'', size, permissions, COMPRESSION_STR, 0)
+				return
+			if os.path.isdir(p):
+				items_in_dir = os.listdir(p)
+				files_to_backup[p] = FILE(p, '', True, False, 0, 0, b'', b'', 0, permissions, COMPRESSION_STR, 0)
+				for item in items_in_dir:
+					traverse_dir(os.path.join(p, item))
+		except PermissionError as e:
+			wprint(f'Permission denied for {p}. {e}')
 
 	print('Backing up system...')
 	files_to_backup = {}
