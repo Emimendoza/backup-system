@@ -624,6 +624,7 @@ def handle_old(f: FILE) -> None:
 	f.deleted = True
 	f.deleted_at = int(datetime.datetime.now().timestamp())
 	SQLITE_CONNECTION.execute(INSERT, f.to_sql())
+	SQLITE_CONNECTION.commit()
 
 
 def handle_new(f: FILE) -> None:
@@ -635,6 +636,7 @@ def handle_new(f: FILE) -> None:
 			f.remote_path = new_path
 			f.uploaded_at = int(datetime.datetime.now().timestamp())
 			SQLITE_CONNECTION.execute(INSERT, f.to_sql())
+			SQLITE_CONNECTION.commit()
 			vprint(f'Uploaded {f.local_path} to {f.remote_path}')
 			return None
 		except OSError as e:
