@@ -912,6 +912,12 @@ def parse_paths():
 	PATHS_TO_BACKUP = args.paths_to_backup
 	PATHS_TO_EXCLUDE = args.paths_to_exclude
 
+	if '\\MOUNT_PATH' in PATHS_TO_BACKUP:
+		wprint('Cannot backup the mount path. Removing from backup list')
+		PATHS_TO_BACKUP.remove('\\MOUNT_PATH')
+	if '\\MOUNT_PATH' not in PATHS_TO_EXCLUDE:
+		PATHS_TO_EXCLUDE.append('\\MOUNT_PATH')
+
 	BASE_PATH = get_real_path(BASE_PATH)
 	KEY_PATH = get_real_path(KEY_PATH)
 	MOUNT_PATH = get_real_path(MOUNT_PATH)
