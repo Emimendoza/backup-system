@@ -517,12 +517,12 @@ def finish_transaction():
 def purge_system():
 	print('Purging deleted files...')
 	# First we delete old files from half finished uploads
-	result = SQLITE_CONNECTION.execute(GET_ALL_COLUMN, ('uploading', 1)).fetchall()
+	result = SQLITE_CONNECTION.execute(GET_ALL_COLUMN, ('uploading', True)).fetchall()
 	for file in result:
 		file = FILE(*file)
-		wprint(f'File {file.local_path} was uploading. Deleting {file.remote_path}...')
+		wprint(f'File {file.local_path} was uploading. Deleting...')
 		os.remove(file.remote_path)
-		SQLITE_CONNECTION.execute(DELETE, (file.local_path,))
+		SQLITE_CONNECTION.execute(DELETE_FROM_REMOTE, (file.remote_path,))
 	# Now we look at the files in the db and mark them as deleted if they don't exist
 	cursor = SQLITE_CONNECTION.execute(GET_ALL_NAMES_COLUMN, ('deleted', 0))
 	files = [f[0] for f in cursor.fetchall()]
@@ -554,16 +554,6 @@ def purge_system():
 		else:
 			vprint(f'File {file.local_path} not yet ready to be purged')
 	print('Purged deleted files')
-	for file in os.listdir(MOUNT_PATH):
-		if not file.startswith('enc_'):
-			continue
-		file = os.path.abspath(os.path.join(MOUNT_PATH, file))
-		cursor = SQLITE_CONNECTION.execute(GET_SINGLE_FILE_REMOTE, (file,))
-		if cursor.fetchone() is None:
-			wprint(f'File {file} not found in db. Delete?')
-			if prompt_option(['Yes', 'No']) == 0:
-				os.remove(file)
-				vprint(f'Deleted {file}')
 	finish_transaction()
 
 
