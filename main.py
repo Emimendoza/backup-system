@@ -9,6 +9,7 @@ import sqlite3
 import fcntl
 import time
 from abc import ABC, abstractmethod
+from copy import copy
 from io import TextIOWrapper
 
 import tqdm
@@ -64,11 +65,11 @@ CREATE TABLE IF NOT EXISTS VARS (
 key TEXT PRIMARY KEY,
 value TEXT)
 '''
-SET_SEPERATOR: str = '''
-INSERT OR IGNORE INTO VARS (key, value) VALUES ('SEPERATOR', ?)
+SET_VAR: str = '''
+INSERT OR IGNORE INTO VARS (key, value) VALUES (?, ?)
 '''
-GET_SEPERATOR: str = '''
-SELECT value FROM VARS WHERE key = 'SEPERATOR'
+GET_VAR: str = '''
+SELECT value FROM VARS WHERE key = ?
 '''
 GET_TOP_LEVEL: str = '''
 SELECT * FROM FILES WHERE local_path like ? || '%' AND local_path NOT LIKE ? || '%' || ? || '_%'
@@ -97,12 +98,27 @@ VALUES
 DELETE: str = '''
 DELETE FROM FILES WHERE local_path = ?
 '''
-GET_ALL_NAMES_NOT_DEL: str = '''
-SELECT local_path FROM FILES WHERE deleted = 0
+DELETE_FROM_REMOTE: str = '''
+DELETE FROM FILES WHERE remote_path = ?
 '''
 
-GET_ALL_DELETED: str = '''
-SELECT * FROM FILES WHERE deleted = 1
+GET_ALL_NAMES_COLUMN: str = '''
+SELECT local_path FROM FILES WHERE ? = ?
+'''
+
+GET_ALL_COLUMN: str = '''
+SELECT * FROM FILES WHERE ? = ?
+'''
+
+ADD_COLUMN: str = '''
+ALTER TABLE FILES ADD COLUMN ? ?
+'''
+
+SET_ALL_IN_COLUMN: str = '''
+UPDATE FILES SET ? = ?
+'''
+SET_IN_NAME: str = '''
+UPDATE FILES SET ? = ? WHERE local_path = ?
 '''
 
 
@@ -115,10 +131,14 @@ def bytes_to_human(size: int) -> AnyStr:
 	return f'{size:.2f} PB'
 
 
-def sha512_str(s: AnyStr) -> bytes:
-	digest = hashes.Hash(hashes.SHA512())
-	digest.update(s.encode('utf-8'))
-	return digest.finalize()
+def update_db_v0_v1():
+	result = SQLITE_CONNECTION.execute(GET_VAR, ('VERSION',)).fetchone()
+	if result is not None:
+		return
+	SQLITE_CONNECTION.execute(SET_VAR, ('VERSION', '1'))
+	SQLITE_CONNECTION.execute(ADD_COLUMN, ('uploading', 'BOOLEAN'))
+	SQLITE_CONNECTION.execute(SET_ALL_IN_COLUMN, ('uploading', False))
+	SQLITE_CONNECTION.commit()
 
 
 def sha512_file(file: AnyStr) -> bytes:
@@ -150,11 +170,12 @@ class FILE:
 	permissions: int
 	compression: AnyStr
 	compressed_size: int
+	uploading: bool
 
 	def to_sql(self):
 		return (
 			self.local_path, self.remote_path, self.folder, self.deleted, self.deleted_at, self.uploaded_at, self.iv,
-			self.sha512, self.size, self.permissions, self.compression, self.compressed_size)
+			self.sha512, self.size, self.permissions, self.compression, self.compressed_size, self.uploading)
 
 	def str(self):
 		return f'[{'DIR' if self.folder else 'FIL'}] {self.local_path} | {bytes_to_human(self.size)}'
@@ -299,8 +320,8 @@ LOCK_FD: TextIOWrapper | None = None
 vprint: callable = lambda *a, **k: None
 mutex = multiprocessing.Lock()
 file_mutex = multiprocessing.Lock()
+db_mutex = multiprocessing.Lock()
 queue = multiprocessing.Queue()
-result_queue = multiprocessing.Queue()
 
 
 def wprint(*nargs, **kwargs):
@@ -453,7 +474,8 @@ def get_key() -> bytes:
 def encrypt_file_op(info: List[AnyStr]):
 	key = get_key()
 	iv = os.urandom(16)
-	f = FILE(get_real_path(info[0]), get_real_path(info[1]), False, False, 0, 0, iv, b'', 0, 0, COMPRESSION_STR, 0)
+	f = FILE(get_real_path(info[0]), get_real_path(info[1]), False, False, 0, 0, iv, b'', 0, 0, COMPRESSION_STR, 0,
+	         False)
 	f.compressed_size, _ = encrypt_file(f, iv, key)
 	iv_and_size = iv + f.compressed_size.to_bytes(8, 'big')
 	print(f'Generated IV-Len: {base64.b64encode(iv_and_size).decode("utf-8")}\nYou need this to decrypt the file.')
@@ -465,7 +487,8 @@ def decrypt_file_op(info: List[AnyStr]):
 	iv_and_size = base64.b64decode(info[2])
 	iv = iv_and_size[:16]
 	size = int.from_bytes(iv_and_size[-8:], 'big')
-	f = FILE(get_real_path(info[1]), get_real_path(info[0]), False, False, 0, 0, iv, b'', 0, 0, COMPRESSION_STR, size)
+	f = FILE(get_real_path(info[1]), get_real_path(info[0]), False, False, 0, 0, iv, b'', 0, 0, COMPRESSION_STR, size,
+	         False)
 	decrypt_file(f, iv, key)
 	print(f'Decrypted {info[0]} from {info[1]}')
 
@@ -479,7 +502,7 @@ def finish_transaction():
 	key = get_key()
 	iv = os.urandom(16)
 	dest = os.path.join(MOUNT_PATH, 'METADATA-BACKUP.sqlite3.enc')
-	file = FILE(METADATA_PATH, dest, False, False, 0, 0, iv, b'', 0, 0, COMPRESSION_STR, 0)
+	file = FILE(METADATA_PATH, dest, False, False, 0, 0, iv, b'', 0, 0, COMPRESSION_STR, 0, False)
 	file.compressed_size, sha = encrypt_file(file, iv, key)
 	with open(METADATA_IV_PATH, 'w', encoding='utf-8') as f:
 		f.write(f'IV:{base64.b64encode(iv).decode('utf-8')}\n')
@@ -494,12 +517,14 @@ def finish_transaction():
 def purge_system():
 	print('Purging deleted files...')
 	# First we delete old files from half finished uploads
-	for file in os.listdir(MOUNT_PATH):
-		if file.startswith('tmp_'):
-			wprint(f'Deleting half finished upload {file}')
-			os.remove(os.path.join(MOUNT_PATH, file))
+	result = SQLITE_CONNECTION.execute(GET_ALL_COLUMN, ('uploading', 1)).fetchall()
+	for file in result:
+		file = FILE(*file)
+		wprint(f'File {file.local_path} was uploading. Deleting {file.remote_path}...')
+		os.remove(file.remote_path)
+		SQLITE_CONNECTION.execute(DELETE, (file.local_path,))
 	# Now we look at the files in the db and mark them as deleted if they don't exist
-	cursor = SQLITE_CONNECTION.execute(GET_ALL_NAMES_NOT_DEL)
+	cursor = SQLITE_CONNECTION.execute(GET_ALL_NAMES_COLUMN, ('deleted', 0))
 	files = [f[0] for f in cursor.fetchall()]
 	for file in files:
 		if os.path.exists(file):
@@ -514,7 +539,7 @@ def purge_system():
 		SQLITE_CONNECTION.execute(INSERT_REPLACE, f.to_sql())
 		vprint(f'Marked {file} as deleted')
 	# Now we look at the files in the db and delete them if they are old
-	cursor = SQLITE_CONNECTION.execute(GET_ALL_DELETED)
+	cursor = SQLITE_CONNECTION.execute(GET_ALL_COLUMN, ('deleted', 1))
 	files = [FILE(*f) for f in cursor.fetchall()]
 	for file in files:
 		if file.deleted_at == 0:
@@ -560,35 +585,37 @@ def backup_if_sha512(file: FILE, sha: bytes, key) -> None:
 			return
 		vprint(f'File {file.local_path} the same as the last backup')
 		queue.put(1)
-		result_queue.put(None)
 	except Exception as e:
 		wprint(f'Error hashing {file.local_path}. {e}')
 		queue.put(1)
-		result_queue.put(None)
 
 
-def get_tempfile_name():
+def allocate_path(file: FILE) -> AnyStr:
 	while True:
 		digest = hashes.Hash(hashes.SHA512())
 		digest.update(os.urandom(32))
-		unique = digest.finalize().hex()
-		unique = os.path.join(MOUNT_PATH, f'tmp_{unique}')
-		with file_mutex:
-			if not os.path.exists(unique):
-				open(unique, 'w').close()
+		digest.update(file.local_path.encode('utf-8'))
+		unique = os.path.abspath(os.path.join(MOUNT_PATH, f'enc_{digest.finalize().hex()}'))
+		with db_mutex:
+			result = SQLITE_CONNECTION.execute(GET_SINGLE_FILE_REMOTE, (unique,)).fetchone()
+			if result is None:
+				c = copy(file)
+				c.remote_path = unique
+				c.local_path = unique
+				SQLITE_CONNECTION.execute(INSERT, c.to_sql())
+				SQLITE_CONNECTION.commit()
 				return unique
 
 
 def unconditional_backup(file: FILE, key) -> None:
 	file.iv = os.urandom(16)
-	file.remote_path = get_tempfile_name()
+	file.remote_path = allocate_path(file)
 	compressed_size, sha = (0, b'')
 	while True:
 		try:
 			if not os.path.exists(file.local_path):
 				wprint(f'File {file.local_path} does not exist')
 				queue.put(1)
-				result_queue.put(None)
 				return
 			compressed_size, sha = encrypt_file(file, file.iv, key)
 			break
@@ -598,65 +625,77 @@ def unconditional_backup(file: FILE, key) -> None:
 		except Exception as e:
 			wprint(f'Error encrypting {file.local_path}. {e}')
 		time.sleep(5)
-
 	file.compressed_size = compressed_size
 	file.sha512 = sha
 	file.uploaded_at = int(datetime.datetime.now().timestamp())
+	handle_file(file)
 	queue.put(1)
-	result_queue.put(file)
 
 
 def backup_dir(file: FILE) -> None:
 	try:
 		file.permissions = os.stat(file.local_path).st_mode
 		file.uploaded_at = int(datetime.datetime.now().timestamp())
+		handle_file(file)
 		queue.put(1)
-		result_queue.put(file)
 	except Exception as e:
 		wprint(f'Error backing up {file.local_path}. {e}')
 		queue.put(1)
-		result_queue.put(None)
+
+
+def handle_file(result: FILE) -> None:
+	if result.folder:
+		with db_mutex:
+			f = SQLITE_CONNECTION.execute(GET_SINGLE_FILE, (result.local_path,)).fetchone()
+			if f is None:
+				SQLITE_CONNECTION.execute(INSERT, result.to_sql())
+				return None
+		f = FILE(*f)
+		if not f.folder:
+			handle_old(f)
+			with db_mutex:
+				SQLITE_CONNECTION.execute(INSERT, result.to_sql())
+				return None
+		with db_mutex:
+			SQLITE_CONNECTION.execute(DELETE, (result.local_path,))
+			SQLITE_CONNECTION.execute(INSERT, result.to_sql())
+		return None
+	with db_mutex:
+		f = SQLITE_CONNECTION.execute(GET_SINGLE_FILE, (result.local_path,)).fetchone()
+	if f is None:
+		handle_new(result)
+		return None
+	f = FILE(*f)
+	if f.folder:
+		with db_mutex:
+			SQLITE_CONNECTION.execute(DELETE, (result.local_path,))
+		handle_new(result)
+		return None
+	handle_old(f)
+	handle_new(result)
 
 
 def handle_old(f: FILE) -> None:
-	SQLITE_CONNECTION.execute(DELETE, (f.local_path,))
+	old_path = f.local_path
 	f.local_path += f'.old{datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")}'
 	f.deleted = True
 	f.deleted_at = int(datetime.datetime.now().timestamp())
-	SQLITE_CONNECTION.execute(INSERT, f.to_sql())
-	SQLITE_CONNECTION.commit()
+	with db_mutex:
+		SQLITE_CONNECTION.execute(DELETE, (old_path,))
+		SQLITE_CONNECTION.execute(INSERT, f.to_sql())
+		SQLITE_CONNECTION.commit()
 
 
 def handle_new(f: FILE) -> None:
-	while True:
-		try:
-			new_path = os.path.join(MOUNT_PATH, get_unique_name(f.local_path))
-			new_path = os.path.abspath(new_path)
-			os.rename(f.remote_path, new_path)
-			f.remote_path = new_path
-			f.uploaded_at = int(datetime.datetime.now().timestamp())
-			SQLITE_CONNECTION.execute(INSERT, f.to_sql())
-			SQLITE_CONNECTION.commit()
-			vprint(f'Uploaded {f.local_path} to {f.remote_path}')
-			return None
-		except OSError as e:
-			if e.errno == 107:
-				vprint(f'Remote has disconnected. Retrying...')
-		except Exception as e:
-			wprint(f'Error uploading {f.local_path}. {e}')
-			return None
-		time.sleep(5)
-
-
-def get_unique_name(path: AnyStr) -> AnyStr:
-	while True:
-		digest = hashes.Hash(hashes.SHA512())
-		digest.update(os.urandom(32))
-		digest.update(path.encode('utf-8'))
-		unique = os.path.abspath(os.path.join(MOUNT_PATH, f'enc_{digest.finalize().hex()}'))
-		cursor = SQLITE_CONNECTION.execute(GET_SINGLE_FILE_REMOTE, (unique,))
-		if cursor.fetchone() is None:
-			return unique
+	f.uploaded_at = int(datetime.datetime.now().timestamp())
+	f.uploading = False
+	with db_mutex:
+		# Delete temp entry used to reserve remote name
+		if not f.folder:
+			SQLITE_CONNECTION.execute(DELETE_FROM_REMOTE, (f.remote_path,))
+		SQLITE_CONNECTION.execute(INSERT_REPLACE, f.to_sql())
+		SQLITE_CONNECTION.commit()
+	vprint(f'Uploaded {f.local_path} to {f.remote_path}')
 
 
 def backup_system():
@@ -675,11 +714,12 @@ def backup_system():
 			if os.path.isfile(p):
 				# Get file info
 				size = os.path.getsize(p)
-				files_to_backup[p] = FILE(p, '', False, False, 0, 0, b'', b'', size, permissions, COMPRESSION_STR, 0)
+				files_to_backup[p] = FILE(p, '', False, False, 0, 0, b'', b'', size, permissions, COMPRESSION_STR, 0,
+				                          True)
 				return
 			if os.path.isdir(p):
 				items_in_dir = os.listdir(p)
-				files_to_backup[p] = FILE(p, '', True, False, 0, 0, b'', b'', 0, permissions, COMPRESSION_STR, 0)
+				files_to_backup[p] = FILE(p, '', True, False, 0, 0, b'', b'', 0, permissions, COMPRESSION_STR, 0, False)
 				for item in items_in_dir:
 					traverse_dir(os.path.join(p, item))
 		except PermissionError as e:
@@ -701,8 +741,8 @@ def backup_system():
 			if file.folder:
 				pool.apply_async(backup_dir, (file,))
 				continue
-			cursor = SQLITE_CONNECTION.execute(GET_SINGLE_FILE, (file.local_path,))
-			resul = cursor.fetchone()
+			with db_mutex:
+				resul = SQLITE_CONNECTION.execute(GET_SINGLE_FILE, (file.local_path,)).fetchone()
 			if resul is None:
 				pool.apply_async(unconditional_backup, (file, key))
 				continue
@@ -719,37 +759,6 @@ def backup_system():
 				continue
 			vprint(f'File {file.local_path} the same as the last backup')
 			queue.put(1)
-			result_queue.put(None)
-		counter = 0
-		while counter < total:
-			result: FILE | None = result_queue.get()
-			counter += 1
-			if result is None:
-				continue
-			if result.folder:
-				f = SQLITE_CONNECTION.execute(GET_SINGLE_FILE, (result.local_path,)).fetchone()
-				if f is None:
-					SQLITE_CONNECTION.execute(INSERT, result.to_sql())
-					continue
-				f = FILE(*f)
-				if not f.folder:
-					handle_old(f)
-					SQLITE_CONNECTION.execute(INSERT, result.to_sql())
-					continue
-				SQLITE_CONNECTION.execute(DELETE, (result.local_path,))
-				SQLITE_CONNECTION.execute(INSERT, result.to_sql())
-				continue
-			f = SQLITE_CONNECTION.execute(GET_SINGLE_FILE, (result.local_path,)).fetchone()
-			if f is None:
-				handle_new(result)
-				continue
-			f = FILE(*f)
-			if f.folder:
-				SQLITE_CONNECTION.execute(DELETE, (result.local_path,))
-				handle_new(result)
-				continue
-			handle_old(f)
-			handle_new(result)
 	purge_system()
 
 
@@ -958,11 +967,12 @@ if __name__ == '__main__':
 	if args.generate_key or args.backup or args.restore or args.purge:
 		# make dirs if they don't exist
 		os.makedirs(MOUNT_PATH, exist_ok=True, mode=0o700)
-		SQLITE_CONNECTION = sqlite3.connect(METADATA_PATH)
+		SQLITE_CONNECTION = sqlite3.connect(METADATA_PATH, check_same_thread=False)
 		SQLITE_CONNECTION.execute(CREATE_MAIN_TABLE)
 		SQLITE_CONNECTION.execute(CREATE_VARS_TABLE)
-		SQLITE_CONNECTION.execute(SET_SEPERATOR, (os.sep,))
-		SEPERATOR = SQLITE_CONNECTION.execute(GET_SEPERATOR).fetchone()[0]
+		SQLITE_CONNECTION.execute(SET_VAR, (SEPERATOR, os.sep,))
+		SEPERATOR = SQLITE_CONNECTION.execute(GET_VAR, ('SEPERATOR',)).fetchone()[0]
+		update_db_v0_v1()
 		get_flock()
 	if args.generate_key:
 		generate_key()
