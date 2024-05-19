@@ -136,6 +136,7 @@ def update_db_v0_v1():
 	if result is not None:
 		return
 	SQLITE_CONNECTION.execute(SET_VAR, ('VERSION', '1'))
+	SQLITE_CONNECTION.execute(SET_VAR, ('UUID', os.urandom(16).hex()))
 	SQLITE_CONNECTION.execute(ADD_COLUMN, ('uploading', 'BOOLEAN'))
 	SQLITE_CONNECTION.execute(SET_ALL_IN_COLUMN, ('uploading', False))
 	SQLITE_CONNECTION.commit()
